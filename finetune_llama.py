@@ -37,10 +37,9 @@ def create_translation_pairs():
     with open('ds/input.json', 'r', encoding='utf-8') as f:
         data = json.load(f)
     
-    # Create instruction format for each text
     formatted_data = []
     
-    # Example translations to seed the model
+    # Example translations including formal/complex examples
     example_pairs = [
         {
             "english": "Hello, how are you?",
@@ -141,24 +140,63 @@ def create_translation_pairs():
         {
             "english": "I don't understand",
             "saxon": "Iech versteh net"
+        },
+        {
+            "english": "Our research team is conducting important studies",
+            "saxon": "Unner Forschergrupp macht wichtige Unnersuchungen"
+        },
+        {
+            "english": "The university's main building is located in the city center",
+            "saxon": "'s Hauptgebäude vun dr Uni stieht mittich in dr Stadt"
+        },
+        {
+            "english": "The conference will be held next month with international participants",
+            "saxon": "De Konferenz werd nächstn Monat mit Leit aus aller Welt abgehaltn"
+        },
+        {
+            "english": "We are proud to announce our latest research findings",
+            "saxon": "Mir sein stolz, dass mr eich unner neistn Forschungsergebnisse zoign kenne"
+        },
+        {
+            "english": "The collaboration between different departments has been successful",
+            "saxon": "De Zusammenarbt zwischn de verschiedn Abteilungen is gut geloffn"
         }
     ]
     
-    # Add example pairs first
+    # Add example pairs with consistent translation prompt
     for pair in example_pairs:
         formatted_data.append({
-            'text': f"<s>[INST] Translate to Saxon dialect:\n{pair['english']} [/INST] {pair['saxon']}</s>"
+            'text': f"<s>[INST] You are a translator for the Saxon German dialect. Translate this English text to Saxon. Keep the Saxon style informal and authentic:\n\n{pair['english']}\n\nSaxon translation: [/INST] {pair['saxon']}</s>",
+            'english': pair['english'],
+            'saxon': pair['saxon']
         })
     
-    # Then add the Saxon texts as examples of the target style
+    # Extract patterns from Saxon texts to create more training examples
     for item in data['texts']:
         saxon_text = item['text']
-        # Add as style example
         formatted_data.append({
-            'text': f"<s>[INST] This is an example of Saxon dialect:\n{saxon_text} [/INST] Thank you for showing me this example of Saxon dialect.</s>"
+            'text': f"<s>[INST] You are a translator for the Saxon German dialect. Translate this English text to Saxon. Keep the Saxon style informal and authentic:\n\nThe text must be translated to authentic Saxon dialect, not standard German. Here's the text:\n\n{saxon_text}\n\nSaxon translation: [/INST] {saxon_text}</s>",
+            'english': "Text sample",  # Placeholder
+            'saxon': saxon_text
         })
     
-    return Dataset.from_list(formatted_data)
+    # Create dataset and split
+    full_dataset = Dataset.from_list(formatted_data)
+    
+    # Split dataset into train, validation, and test
+    splits = full_dataset.train_test_split(test_size=0.2, shuffle=True, seed=42)
+    train_test = splits['train'].train_test_split(test_size=0.15, shuffle=True, seed=42)
+    
+    train_dataset = train_test['train']
+    val_dataset = train_test['test']
+    test_dataset = splits['test']
+    
+    print(f"Total examples: {len(full_dataset)}")
+    print(f"Training examples: {len(train_dataset)}")
+    print(f"Validation examples: {len(val_dataset)}")
+    print(f"Test examples: {len(test_dataset)}")
+    
+    return train_dataset, val_dataset, test_dataset
 
 # Model configuration
 model_name = "mistralai/Mistral-7B-v0.1"
@@ -166,7 +204,7 @@ local_model_path = "./mistral-base"
 
 # Quantization configuration
 bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
+    yesad_in_4bit=True,
     bnb_4bit_quant_type="nf4",
     bnb_4bit_compute_dtype=torch.float16,
     bnb_4bit_use_double_quant=False
@@ -226,10 +264,9 @@ lora_config = LoraConfig(
 
 model = get_peft_model(model, lora_config)
 
-# Create and process dataset
-print("Preparing dataset...")
-dataset = create_translation_pairs()
-print(f"Dataset size: {len(dataset)}")
+# Create and process datasets
+print("Preparing datasets...")
+train_dataset, val_dataset, test_dataset = create_translation_pairs()
 
 def tokenize_function(examples):
     return tokenizer(
@@ -240,51 +277,81 @@ def tokenize_function(examples):
         return_tensors="pt"
     )
 
-# Tokenize dataset
-tokenized_dataset = dataset.map(
+# Tokenize all datasets
+train_tokenized = train_dataset.map(
     tokenize_function,
     batched=True,
-    remove_columns=dataset.column_names
+    remove_columns=train_dataset.column_names
+)
+
+val_tokenized = val_dataset.map(
+    tokenize_function,
+    batched=True,
+    remove_columns=val_dataset.column_names
+)
+
+test_tokenized = test_dataset.map(
+    tokenize_function,
+    batched=True,
+    remove_columns=test_dataset.column_names
 )
 
 # Training arguments optimized for Mistral
 training_args = TrainingArguments(
     output_dir="./mistral-saxon-translator",
     num_train_epochs=10,
-    per_device_train_batch_size=2,  # Reduced batch size
-    gradient_accumulation_steps=8,  # Increased gradient accumulation
-    warmup_ratio=0.03,
-    learning_rate=1e-4,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    gradient_accumulation_steps=8,
+    warmup_ratio=0.05,
+    learning_rate=5e-5,
     fp16=True,
     logging_steps=10,
-    save_strategy="epoch",
+    save_strategy="steps",
+    save_steps=50,
+    eval_strategy="steps",
+    eval_steps=50,
+    save_total_limit=3,
     optim="paged_adamw_32bit",
     lr_scheduler_type="cosine",
     gradient_checkpointing=True,
     remove_unused_columns=False,
-    report_to="none"
+    report_to="none",
+    load_best_model_at_end=True,
+    metric_for_best_model="loss",
+    greater_is_better=False,
+    push_to_hub=False
 )
 
-# Create trainer
+# Create trainer with evaluation dataset
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_dataset,
-    data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    train_dataset=train_tokenized,
+    eval_dataset=val_tokenized,
+    data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+    compute_metrics=lambda eval_pred: {
+        "loss": eval_pred.predictions.mean()
+    }
 )
 
 # Train the model
 print("Starting training...")
 trainer.train()
 
-# Save the model
+# Evaluate on test set
+print("\nEvaluating on test set...")
+test_results = trainer.evaluate(test_tokenized)
+print(f"Test results: {test_results}")
+
+# Save the best model
 model.save_pretrained("./mistral-saxon-translator")
 tokenizer.save_pretrained("./mistral-saxon-translator")
 print("Training completed and model saved!")
 
 def test_translation(text, max_length=512):
     """Test the model's translation capabilities."""
-    prompt = f"<s>[INST] Translate the following English text to Saxon dialect:\n{text} [/INST]"
+    prompt = f"<s>[INST] You are a translator for the Saxon German dialect. Translate this English text to Saxon. Keep the Saxon style informal and authentic. Do not use standard German, use proper Saxon dialect:\n\n{text}\n\nSaxon translation: [/INST]"
     
     inputs = tokenizer(prompt, return_tensors="pt", padding=True)
     inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -292,13 +359,19 @@ def test_translation(text, max_length=512):
     outputs = model.generate(
         **inputs,
         max_new_tokens=max_length,
-        temperature=0.7,
+        temperature=0.8,  # Slightly increased for more dialectal variation
+        top_p=0.9,
         num_return_sequences=1,
         do_sample=True,
-        pad_token_id=tokenizer.eos_token_id
+        pad_token_id=tokenizer.eos_token_id,
+        repetition_penalty=1.2
     )
     
-    return tokenizer.decode(outputs[0], skip_special_tokens=True).split("[/INST]")[-1].strip()
+    # Extract only the translation part
+    translation = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    if "Saxon translation:" in translation:
+        translation = translation.split("Saxon translation:")[-1].strip()
+    return translation
 
 # Test cases
 print("\nTesting the model with example translations:")
